@@ -766,6 +766,9 @@ GROK_USAGE_URL = ("https://grok.com/grok_api_v2.GrokBuildBilling/"
 # a bearer within this many seconds of expiry is treated as already expired:
 # headroom never refreshes, so a token about to lapse would 401 mid-flight
 GROK_TOKEN_LEEWAY = 60
+# cap the billing response read — the real payload is ~100 bytes, so an abnormal
+# or hostile response must never be read unbounded into the collector's memory
+GROK_MAX_RESPONSE_BYTES = 1024 * 1024
 GROK_HOLD_NOTES = {
     "grok_local_binding_missing": (
         "no Grok login in this slot (missing ~/.grok/auth.json, or it lacks an "
@@ -892,6 +895,11 @@ def _grok_grpc_frames(body):
             raise ValueError("truncated gRPC-web frame")
         frames.append((flag, body[pos:pos + length]))
         pos += length
+    # fail closed: a well-formed response is data frame(s) + trailer with no
+    # remainder, so leftover bytes (a partial frame header, or garbage past the
+    # trailer) mean a malformed/truncated response — never parse it as valid
+    if pos != size:
+        raise ValueError("trailing bytes after the last gRPC-web frame")
     return frames
 
 
@@ -991,14 +999,23 @@ def grok_limits(home, opener=open_authenticated, now=None):
     )
     try:
         with opener(request, timeout=30) as response:
-            body = response.read()
+            # cap the read (one byte past the cap detects an over-limit body):
+            # a hostile/abnormal response must never be pulled unbounded into
+            # the collector's memory
+            body = response.read(GROK_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
             # auth rejection is not capacity: hold with a distinct code instead
             # of letting a raw HTTPError surface as a generic collector error
             raise IdentityBindingError("grok_usage_rejected") from error
         raise
-    frames = _grok_grpc_frames(body)
+    if len(body) > GROK_MAX_RESPONSE_BYTES:
+        raise IdentityBindingError("grok_missing_weekly")
+    try:
+        frames = _grok_grpc_frames(body)
+    except ValueError as error:
+        # malformed / truncated framing → hold, never parse partial data
+        raise IdentityBindingError("grok_missing_weekly") from error
     # require grpc-status:0 — a non-zero status inside an HTTP 200 is a
     # rejection, not data, and must never be read as capacity
     if _grok_grpc_status(frames) != 0:

@@ -2879,8 +2879,8 @@ class _GrokResp:
     def __exit__(self, *exc):
         return False
 
-    def read(self):
-        return self._body
+    def read(self, size=-1):
+        return self._body if size is None or size < 0 else self._body[:size]
 
 
 def _grok_opener(body):
@@ -3054,6 +3054,22 @@ class GrokLimits(unittest.TestCase):
     def test_missing_weekly_holds(self):
         # grpc-status 0, but the GrokCreditsConfig carries no period
         body = _grok_response(bytes([0x0a, 0x00]), status=0)
+        with self._auth():
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=_grok_opener(body))
+        self.assertEqual(caught.exception.code, "grok_missing_weekly")
+
+    def test_oversized_response_holds(self):
+        # an abnormal/hostile response over the cap is held, never read unbounded
+        big = b"x" * (collect.GROK_MAX_RESPONSE_BYTES + 100)
+        with self._auth():
+            with self.assertRaises(collect.IdentityBindingError) as caught:
+                collect.grok_limits("/h", opener=_grok_opener(big))
+        self.assertEqual(caught.exception.code, "grok_missing_weekly")
+
+    def test_trailing_bytes_after_frames_hold(self):
+        # leftover bytes past the trailer = malformed response → fail closed
+        body = _grok_response(bytes([0x0a, 0x00]), status=0) + b"\x99\x99"
         with self._auth():
             with self.assertRaises(collect.IdentityBindingError) as caught:
                 collect.grok_limits("/h", opener=_grok_opener(body))
