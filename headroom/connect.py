@@ -28,11 +28,14 @@ CREDENTIAL_FILES = {
     "codex": ["auth.json"],
     "grok": ["auth.json"],
 }
-# Auto-detection homes for the wizard's adopt flow. Grok is intentionally absent:
-# headroom never runs the grok login, so grok slots are adopted explicitly
-# (`connect --adopt ~/.grok --provider grok`) or added via config.json, not
-# auto-offered — see connect_fresh's refusal below.
-DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
+# Auto-detection homes for the wizard's adopt flow. Grok is adopt-only:
+# headroom never RUNS the grok login (see connect_fresh's refusal below), but
+# an existing ~/.grok login is offered for adoption like any other credential.
+DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex", "grok": "~/.grok"}
+# The provider CLIs' own home-override variables, honoured when detecting
+# existing logins so detection follows the same home the CLI itself would use.
+HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
+            "grok": "GROK_HOME"}
 
 
 def provider_binary(provider):
@@ -102,12 +105,7 @@ def detect_existing():
     """Discover logins already on this machine, for the wizard/adopt flow."""
     found = []
     for provider, default in DEFAULT_HOMES.items():
-        home = os.path.expanduser(
-            os.environ.get(
-                "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME",
-                default,
-            )
-        )
+        home = os.path.expanduser(os.environ.get(HOME_ENV[provider], default))
         if not os.path.isdir(home):
             continue
         identity = slot_identity(provider, home)
@@ -366,7 +364,7 @@ def cmd_refresh(args):
 
 
 def cmd_connect(args):
-    """CLI: `headroom connect [name] [--provider claude|codex] [--adopt PATH]`."""
+    """CLI: `headroom connect [name] [--provider claude|codex|grok] [--adopt PATH]`."""
     try:
         config = registry.load()
     except registry.RegistryError:
@@ -393,7 +391,16 @@ def cmd_connect(args):
             name = arg
     if provider not in registry.PROVIDERS:
         provider = prompt_choice("Which provider is this account for?",
-                                 ["claude", "codex"])
+                                 list(registry.PROVIDERS))
+    if provider == "grok" and adopt_path is None:
+        # Grok connects are adopt-only (headroom never runs the grok login).
+        # Default to the CLI's own home when a login is already sitting there,
+        # so plain `headroom connect --provider grok` just works; without one,
+        # fall through to connect_fresh's instructive refusal.
+        candidate = os.environ.get(HOME_ENV["grok"], DEFAULT_HOMES["grok"])
+        if os.path.exists(os.path.join(os.path.expanduser(candidate),
+                                       "auth.json")):
+            adopt_path = candidate
     if name is None:
         taken = {account["name"] for account in config.get("accounts", [])}
         default = next(

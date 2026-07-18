@@ -3,8 +3,9 @@ for Claude Code and Codex subscriptions.
 
 usage:
   headroom setup                    first-run wizard (accounts + dashboard style)
-  headroom connect [name] [--provider claude|codex] [--adopt PATH]
-                                    add an account (fresh login or adopt existing)
+  headroom connect [name] [--provider claude|codex|grok] [--adopt PATH]
+                                    add an account (fresh login or adopt existing;
+                                    grok is adopt-only — log in with the grok CLI)
   headroom auth refresh <slot>     interactively re-login an owned Claude slot
                                     (then run `headroom collect`; never automatic)
   headroom remove <slot> [--yes]   unregister one non-final slot; keeps its home

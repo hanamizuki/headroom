@@ -3321,6 +3321,59 @@ class GrokConnect(unittest.TestCase):
         self.assertEqual(identity["email"], "me@x.ai")
         self.assertEqual(identity["method"], "grok_local_metadata")
 
+    def test_grok_offered_as_interactive_provider_choice(self):
+        """The provider prompt must list every registry provider — a grok
+        seat must be reachable without knowing the --provider flag."""
+        self.assertIn("grok", registry.PROVIDERS)
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {
+                    "HEADROOM_DIR": root,
+                    # empty home: no auth.json, so the grok default-adopt
+                    # stays inert and the flow reaches connect_fresh
+                    "GROK_HOME": os.path.join(root, "empty")}), \
+                mock.patch.object(connect, "prompt_choice",
+                                  return_value="grok") as choice, \
+                mock.patch.object(connect, "connect_fresh",
+                                  return_value=None) as fresh, \
+                mock.patch("builtins.input", return_value="gk"):
+            connect.cmd_connect([])
+        choice.assert_called_once()
+        self.assertEqual(choice.call_args.args[1], list(registry.PROVIDERS))
+        fresh.assert_called_once()  # no login on disk -> instructive refusal
+
+    def test_cmd_connect_grok_defaults_to_adopting_grok_home(self):
+        """`headroom connect gk --provider grok` with a grok login on disk
+        adopts $GROK_HOME without needing an explicit --adopt path."""
+        with tempfile.TemporaryDirectory() as root:
+            grok_home = os.path.join(root, "grokhome")
+            os.makedirs(grok_home)
+            with open(os.path.join(grok_home, "auth.json"), "w") as handle:
+                json.dump({"https://auth.x.ai::client": dict(_GROK_AUTH)},
+                          handle)
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": root,
+                                              "GROK_HOME": grok_home}):
+                code = connect.cmd_connect(["gk", "--provider", "grok"])
+                config = registry.load()
+        self.assertEqual(code, 0)
+        slot = next(a for a in config["accounts"] if a["name"] == "gk")
+        self.assertEqual(slot["provider"], "grok")
+        self.assertEqual(slot["home"], registry.expand(grok_home))
+        self.assertEqual(slot["expected_email"], "me@x.ai")
+
+    def test_detect_existing_offers_grok_login(self):
+        """The wizard's adopt flow must surface an existing $GROK_HOME login
+        alongside claude/codex ones."""
+        with tempfile.TemporaryDirectory() as grok_home:
+            with open(os.path.join(grok_home, "auth.json"), "w") as handle:
+                json.dump({"https://auth.x.ai::client": dict(_GROK_AUTH)},
+                          handle)
+            with mock.patch.dict(os.environ, {"GROK_HOME": grok_home}):
+                found = connect.detect_existing()
+        rows = [row for row in found if row["provider"] == "grok"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["email"], "me@x.ai")
+        self.assertEqual(rows[0]["home"], grok_home)
+
 
 if __name__ == "__main__":
     unittest.main()
