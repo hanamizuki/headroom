@@ -6,6 +6,7 @@ Covers the load-bearing safety logic: config validation, the fail-closed
 router (`block_reason`), redaction, and the public-snapshot projection.
 """
 import ast
+import base64
 import errno
 import importlib
 import json
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -2890,6 +2892,7 @@ _GROK_AUTH = {
     "email": "me@x.ai", "user_id": "u-1", "team_id": "t-1",
     "auth_mode": "oidc",
 }
+_GROK_SCOPE = "https://auth.x.ai::client-uuid"
 
 
 class _GrokResp:
@@ -2941,11 +2944,282 @@ class GrokAuth(unittest.TestCase):
         with open(os.path.join(self.home, "auth.json"), "w") as handle:
             json.dump({"https://auth.x.ai::client-uuid": credential}, handle)
 
+    def test_refresh_owned_home_rotates_tokens_and_preserves_identity(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH,
+            principal_type="user", principal_id="principal-1",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        third_party = dict(
+            credential, key="enterprise-bearer",
+            oidc_issuer="https://login.example.com")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({
+                "https://login.example.com::enterprise-client": third_party,
+                _GROK_SCOPE: credential,
+            }, handle)
+        opener = mock.Mock(return_value=_GrokResp(json.dumps({
+            "access_token": "new-bearer",
+            "refresh_token": "new-refresh",
+            "expires_in": 21600,
+        }).encode()))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertTrue(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        refreshed = collect.grok_auth(owned)
+        self.assertEqual(refreshed["key"], "new-bearer")
+        self.assertEqual(refreshed["refresh_token"], "new-refresh")
+        self.assertEqual(refreshed["email"], "me@x.ai")
+        self.assertEqual(collect.grok_expires_at(refreshed), 1_700_021_600)
+        with open(os.path.join(owned, "auth.json")) as handle:
+            written = json.load(handle)
+        self.assertEqual(
+            written["https://login.example.com::enterprise-client"],
+            third_party)
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, collect.GROK_TOKEN_URL)
+        self.assertEqual(
+            urllib.parse.parse_qs(request.data.decode()),
+            {"grant_type": ["refresh_token"], "refresh_token": ["r"],
+             "client_id": ["client-uuid"], "principal_type": ["user"],
+             "principal_id": ["principal-1"]})
+
+    def test_refresh_refuses_adopted_home_without_network_or_write(self):
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        self._write(credential)
+        auth_path = os.path.join(self.home, "auth.json")
+        with open(auth_path, "rb") as handle:
+            before = handle.read()
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {
+                "HEADROOM_DIR": os.path.join(self.home, "headroom")}):
+            self.assertFalse(collect.grok_refresh_token(
+                self.home, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+        with open(auth_path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_owned_home_accepts_canonical_path_under_symlinked_root(self):
+        real_headroom = os.path.join(self.home, "real-headroom")
+        linked_headroom = os.path.join(self.home, "linked-headroom")
+        owned = os.path.join(real_headroom, "homes", "g")
+        os.makedirs(owned)
+        os.symlink(real_headroom, linked_headroom)
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": linked_headroom}):
+            self.assertTrue(collect._grok_owned_home(
+                os.path.realpath(owned), "g"))
+
+    def test_owned_home_rejects_slot_symlink_to_adopted_home(self):
+        headroom = os.path.join(self.home, "headroom")
+        homes = os.path.join(headroom, "homes")
+        adopted = os.path.join(self.home, "adopted")
+        os.makedirs(homes)
+        os.makedirs(adopted)
+        linked_slot = os.path.join(homes, "g")
+        os.symlink(adopted, linked_slot)
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect._grok_owned_home(linked_slot, "g"))
+
+    def test_owned_home_rejects_other_direct_child_adopted_by_slot(self):
+        headroom = os.path.join(self.home, "headroom")
+        adopted = os.path.join(headroom, "homes", "external-login")
+        os.makedirs(adopted)
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect._grok_owned_home(adopted, "g"))
+
+    def test_refresh_refuses_auth_symlink_to_adopted_credential(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        adopted = os.path.join(self.home, "adopted")
+        os.makedirs(owned)
+        os.makedirs(adopted)
+        adopted_auth = os.path.join(adopted, "auth.json")
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(adopted_auth, "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        with open(adopted_auth, "rb") as handle:
+            before = handle.read()
+        os.symlink(adopted_auth, os.path.join(owned, "auth.json"))
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+        with open(adopted_auth, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_refresh_refuses_hard_linked_adopted_credential(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        adopted = os.path.join(self.home, "adopted")
+        os.makedirs(owned)
+        os.makedirs(adopted)
+        adopted_auth = os.path.join(adopted, "auth.json")
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(adopted_auth, "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        with open(adopted_auth, "rb") as handle:
+            before = handle.read()
+        os.link(adopted_auth, os.path.join(owned, "auth.json"))
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+        with open(adopted_auth, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_refresh_refuses_identity_changed_before_locked_read(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        changed = dict(
+            _GROK_AUTH, user_id="u-2", oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({_GROK_SCOPE: changed}, handle)
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+
+    def test_refresh_refuses_non_xai_oidc_issuer(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="enterprise-client",
+            oidc_issuer="https://login.example.com",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({"https://login.example.com::enterprise-client":
+                       credential}, handle)
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+
+    def test_refresh_busy_auth_lock_fails_without_network(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        lock_context = mock.MagicMock()
+        lock_context.__enter__.return_value = False
+        opener = mock.Mock(side_effect=AssertionError("network must not run"))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                mock.patch.object(collect.locks, "exclusive_lock",
+                                  return_value=lock_context):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        opener.assert_not_called()
+
+    def test_refresh_malformed_response_fails_without_overwrite(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        auth_path = os.path.join(owned, "auth.json")
+        with open(auth_path, "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        with open(auth_path, "rb") as handle:
+            before = handle.read()
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertFalse(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"),
+                opener=mock.Mock(return_value=_GrokResp(b"[]")),
+                now=1_700_000_000))
+
+        with open(auth_path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_refresh_uses_access_token_exp_when_expires_in_is_absent(self):
+        headroom = os.path.join(self.home, "headroom")
+        owned = os.path.join(headroom, "homes", "g")
+        os.makedirs(owned)
+        credential = dict(
+            _GROK_AUTH, oidc_client_id="client-uuid",
+            expires_at="2000-01-01T00:00:00.000000Z")
+        with open(os.path.join(owned, "auth.json"), "w") as handle:
+            json.dump({_GROK_SCOPE: credential}, handle)
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "exp": 1_700_021_600,
+        }).encode()).rstrip(b"=").decode()
+        bearer = f"header.{payload}.signature"
+        opener = mock.Mock(return_value=_GrokResp(json.dumps({
+            "access_token": bearer,
+        }).encode()))
+
+        with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}):
+            self.assertTrue(collect.grok_refresh_token(
+                owned, "g", collect.fingerprint("u-1:t-1"), opener=opener,
+                now=1_700_000_000))
+
+        self.assertEqual(
+            collect.grok_expires_at(collect.grok_auth(owned)), 1_700_021_600)
+
     def test_reads_first_scope_value(self):
         self._write(dict(_GROK_AUTH))
         auth = collect.grok_auth(self.home)
         self.assertEqual(auth["key"], "grok-bearer")
         self.assertEqual(auth["email"], "me@x.ai")
+
+    def test_reads_only_xai_oidc_scope(self):
+        third_party = dict(_GROK_AUTH, key="enterprise-bearer")
+        xai = dict(_GROK_AUTH)
+        with open(os.path.join(self.home, "auth.json"), "w") as handle:
+            json.dump({
+                "https://login.example.com::enterprise-client": third_party,
+                _GROK_SCOPE: xai,
+            }, handle)
+        self.assertEqual(collect.grok_auth(self.home)["key"], "grok-bearer")
+
+        with open(os.path.join(self.home, "auth.json"), "w") as handle:
+            json.dump({
+                "https://login.example.com::enterprise-client": third_party,
+            }, handle)
+        self.assertIsNone(collect.grok_auth(self.home))
 
     def test_missing_file_is_none(self):
         self.assertIsNone(collect.grok_auth(self.home))
@@ -3084,6 +3358,18 @@ class GrokLimits(unittest.TestCase):
                 collect.grok_limits("/h", opener=_grok_opener(body))
         self.assertEqual(caught.exception.code, "grok_missing_weekly")
 
+    def test_invalid_raw_usage_percent_holds_before_rounding(self):
+        body = _grok_response(b"payload", status=0)
+        for percent in (-0.04, 100.01, float("nan"), float("inf")):
+            with self.subTest(percent=percent), self._auth(), \
+                    mock.patch.object(
+                        collect, "_grok_parse_credits",
+                        return_value=(percent, 1_784_839_764)):
+                with self.assertRaises(
+                        collect.IdentityBindingError) as caught:
+                    collect.grok_limits("/h", opener=_grok_opener(body))
+                self.assertEqual(caught.exception.code, "grok_missing_weekly")
+
     def test_oversized_response_holds(self):
         # an abnormal/hostile response over the cap is held, never read unbounded
         big = b"x" * (collect.GROK_MAX_RESPONSE_BYTES + 100)
@@ -3117,6 +3403,64 @@ class GrokCollect(unittest.TestCase):
                 "windows": {"7d": {"used_percent": 12.0, "resets_at": 1784839764,
                                    "window_minutes": 10080, "observed_at": now,
                                    "freshness": "fresh"}}}
+
+    def test_expired_owned_token_refreshes_before_snapshot_binding(self):
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            auth_path = os.path.join(home, "auth.json")
+            expired = dict(
+                _GROK_AUTH, oidc_client_id="client-uuid",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            with open(auth_path, "w") as handle:
+                json.dump({_GROK_SCOPE: expired}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+
+            def refresh(_home, _slot_name, _fingerprint, now=None):
+                fresh = dict(expired, key="new-bearer",
+                             expires_at="2999-01-01T00:00:00.000000Z")
+                with open(auth_path, "w") as handle:
+                    json.dump({_GROK_SCOPE: fresh}, handle)
+                return True
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token",
+                                      side_effect=refresh) as refresh_mock, \
+                    mock.patch.object(collect, "grok_limits",
+                                      return_value=self._windows()):
+                row = collect.collect([account])["accounts"][0]
+
+        refresh_mock.assert_called_once_with(
+            home, "g", collect.fingerprint("u-1:t-1"), now=mock.ANY)
+        self.assertTrue(row["ok"])
+        self.assertEqual(
+            row["identity"]["credential_digest"],
+            hashlib.sha256(b"new-bearer").hexdigest()[:16])
+
+    def test_unexpected_owned_identity_holds_before_refresh(self):
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            expired = dict(
+                _GROK_AUTH, oidc_client_id="client-uuid",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            with open(os.path.join(home, "auth.json"), "w") as handle:
+                json.dump({_GROK_SCOPE: expired}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+            account["expected_email"] = "someone-else@x.ai"
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token") \
+                    as refresh_mock:
+                row = collect.collect([account])["accounts"][0]
+
+        refresh_mock.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "slot_bound_to_unexpected_email")
+        self.assertEqual(row["email"], "me@x.ai")
+        self.assertEqual(row["identity_method"], "grok_local_metadata")
 
     def test_healthy_grok_account_reports_weekly_only(self):
         account = _account("g", "grok")

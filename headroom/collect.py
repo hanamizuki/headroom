@@ -14,9 +14,10 @@ the app-server is unavailable (older Codex CLI). No inference tokens spent.
 Grok (xAI SuperGrok / X Premium+): read the subscription's unified weekly pool
 from the Grok Build billing endpoint (``GrokBuildBilling/GetGrokCreditsConfig``,
 a metadata-only gRPC-web call) using the Grok CLI's own local bearer in each
-slot's ``GROK_HOME``/``~/.grok/auth.json``. Read-only: never refreshes or writes
-the credential, never spends tokens. An expired bearer fails closed (hold) with
-an actionable note — running the ``grok`` CLI once refreshes its own token.
+slot's ``GROK_HOME``/``~/.grok/auth.json``. An expired bearer is refreshed with
+the standard OAuth grant only when the home is under Headroom's own ``homes/``
+root; adopted CLI homes remain read-only to avoid racing their rotation chain.
+Refresh failure holds the slot. No inference tokens are spent.
 
 Fail-closed rules:
   * an account with unverifiable identity or an out-of-range reading is HELD
@@ -42,6 +43,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -753,18 +755,19 @@ def codex_subscription(provider_claims, now=None):
 # -------------------------------------------------------------------- grok
 #
 # Grok (xAI SuperGrok / X Premium+) exposes ONE unified weekly credit pool.
-# Its Build CLI keeps a local OIDC bearer in ``<GROK_HOME>/auth.json``; we read
-# usage from the Build billing endpoint with that bearer and NEVER refresh or
-# write it. The endpoint speaks gRPC-web (protobuf framed over HTTP/1.1), so a
-# tiny stdlib reader below decodes the wire types the response uses (varint +
-# length-delimited messages, plus the fixed32 float carrying the used-percent).
-# Pulling in a protobuf/grpc dependency for three fields would break headroom's
-# zero-dependency, stdlib-only contract.
+# Its Build CLI keeps a local OIDC bearer in ``<GROK_HOME>/auth.json``. Adopted
+# homes stay read-only; isolated Headroom-owned homes may use the standard
+# refresh grant before the billing read. The usage endpoint speaks gRPC-web
+# (protobuf framed over HTTP/1.1), so a tiny stdlib reader below decodes the wire
+# types the response uses. Pulling in a protobuf/grpc dependency for three
+# fields would break headroom's zero-dependency, stdlib-only contract.
 
 GROK_USAGE_URL = ("https://grok.com/grok_api_v2.GrokBuildBilling/"
                   "GetGrokCreditsConfig")
+GROK_ISSUER = "https://auth.x.ai"
+GROK_TOKEN_URL = GROK_ISSUER + "/oauth2/token"
 # a bearer within this many seconds of expiry is treated as already expired:
-# headroom never refreshes, so a token about to lapse would 401 mid-flight
+# a token about to lapse could otherwise 401 mid-flight
 GROK_TOKEN_LEEWAY = 60
 # cap the billing response read — the real payload is ~100 bytes, so an abnormal
 # or hostile response must never be read unbounded into the collector's memory
@@ -774,8 +777,8 @@ GROK_HOLD_NOTES = {
         "no Grok login in this slot (missing ~/.grok/auth.json, or it lacks an "
         "email/user_id) — run the `grok` CLI once to log in; seat held"),
     "grok_token_expired": (
-        "Grok bearer expired — headroom never refreshes credentials. Run the "
-        "`grok` CLI once (it refreshes its own token); reading held until then"),
+        "Grok bearer expired and could not be refreshed — run the `grok` CLI "
+        "for this slot's GROK_HOME; reading held until then"),
     "grok_usage_rejected": (
         "Grok billing endpoint rejected the token (expired or revoked) — run "
         "the `grok` CLI once to refresh it; seat held"),
@@ -785,18 +788,163 @@ GROK_HOLD_NOTES = {
 }
 
 
+def _grok_xai_client(scope):
+    """OIDC client ID only when ``scope`` names the official xAI issuer."""
+    if not isinstance(scope, str):
+        return None
+    issuer, separator, client_id = scope.rpartition("::")
+    return client_id if separator and issuer == GROK_ISSUER and client_id \
+        else None
+
+
+def _grok_xai_pair(data):
+    """The official xAI scope and credential from an auth mapping."""
+    if not isinstance(data, dict):
+        return None
+    return next(((scope, value) for scope, value in data.items()
+                 if _grok_xai_client(scope) and isinstance(value, dict)), None)
+
+
 def grok_auth(home):
     """The single credential object from a Grok CLI ``auth.json``.
 
     The file's top level maps ONE OIDC scope-URL key
-    (``https://auth.x.ai::<client-uuid>``) to the credential object; take the
-    first dict value. None when the file is missing/unreadable or carries no
-    object value (callers then fail closed)."""
+    (``https://auth.x.ai::<client-uuid>``) to the credential object. Ignore
+    other issuers so their bearer can never reach xAI. None when the file is
+    missing/unreadable or carries no xAI object (callers then fail closed)."""
     data = paths.load_json(os.path.join(home, "auth.json"))
-    if not isinstance(data, dict):
-        return None
-    return next((value for value in data.values()
-                 if isinstance(value, dict)), None)
+    pair = _grok_xai_pair(data)
+    return pair[1] if pair else None
+
+
+def _grok_owned_home(home, slot_name):
+    """True only for the canonical Headroom home belonging to ``slot_name``."""
+    if not isinstance(slot_name, str) \
+            or not registry.NAME_RE.fullmatch(slot_name):
+        return False
+    candidate_real = os.path.realpath(os.path.abspath(os.path.expanduser(home)))
+    root_real = os.path.realpath(paths.homes_dir())
+    expected = os.path.join(root_real, slot_name)
+    return os.path.normcase(candidate_real) == os.path.normcase(expected)
+
+
+def grok_refresh_token(home, slot_name, expected_fingerprint,
+                       opener=open_authenticated, now=None):
+    """Refresh one Headroom-owned Grok credential, never an adopted CLI home.
+
+    A non-blocking lock covers the re-read, OAuth rotation, and atomic
+    replacement so two collectors cannot spend the same single-use refresh
+    token concurrently; contention fails closed instead of stalling the fleet.
+    The expected seat fingerprint is revalidated from that locked read before
+    any network call. Returns False on any expected credential/network failure;
+    the caller then keeps the existing ``grok_token_expired`` behavior.
+    """
+    if not _grok_owned_home(home, slot_name):
+        return False
+    auth_path = os.path.join(home, "auth.json")
+    lock_path = auth_path + ".lock"
+    now = time.time() if now is None else now
+    try:
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        with open(lock_path, "a+") as lock_handle:
+            paths.chmod_private(lock_path, 0o600)
+            with locks.exclusive_lock(
+                    lock_handle, blocking=False) as acquired:
+                if not acquired:
+                    return False
+                # Never share a credential inode with an adopted CLI home:
+                # spending its rotating refresh token would invalidate the CLI
+                # even though atomic replacement only replaces the owned path.
+                if os.path.islink(auth_path) \
+                        or os.path.dirname(os.path.realpath(auth_path)) \
+                        != os.path.realpath(home) \
+                        or os.stat(auth_path, follow_symlinks=False).st_nlink != 1:
+                    return False
+                data = paths.load_json(auth_path)
+                pair = _grok_xai_pair(data)
+                if pair is None:
+                    return False
+                scope, auth = pair
+                user_id = auth.get("user_id")
+                team_id = auth.get("team_id")
+                if not user_id or fingerprint(
+                        f"{user_id}:{team_id}" if team_id else user_id
+                ) != expected_fingerprint:
+                    return False
+                expires_at = grok_expires_at(auth)
+                if expires_at is not None \
+                        and expires_at > now + GROK_TOKEN_LEEWAY:
+                    return True  # another collector refreshed while we waited
+                refresh_token = auth.get("refresh_token")
+                scoped_client = _grok_xai_client(scope)
+                if not scoped_client \
+                        or auth.get("oidc_issuer") not in (None, GROK_ISSUER) \
+                        or auth.get("auth_mode") not in (None, "oidc"):
+                    return False
+                client_id = auth.get("oidc_client_id")
+                if not client_id:
+                    client_id = scoped_client
+                if not isinstance(refresh_token, str) or not refresh_token \
+                        or not isinstance(client_id, str) or not client_id:
+                    return False
+                form = {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                }
+                for field in ("principal_type", "principal_id"):
+                    if isinstance(auth.get(field), str) and auth[field]:
+                        form[field] = auth[field]
+                request = urllib.request.Request(
+                    GROK_TOKEN_URL,
+                    data=urllib.parse.urlencode(form).encode(),
+                    headers={
+                        "content-type": "application/x-www-form-urlencoded",
+                        "user-agent": "headroom",
+                    },
+                    method="POST",
+                )
+                with opener(request, timeout=30) as response:
+                    body = response.read(65537)
+                if len(body) > 65536:
+                    return False
+                payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    return False
+                access_token = payload.get("access_token")
+                rotated = payload.get("refresh_token", refresh_token)
+                expires_in = payload.get("expires_in")
+                if not isinstance(access_token, str) or not access_token \
+                        or not isinstance(rotated, str) or not rotated:
+                    return False
+                expires_epoch = None
+                if not isinstance(expires_in, bool) \
+                        and isinstance(expires_in, (int, float)) \
+                        and math.isfinite(expires_in) \
+                        and expires_in > GROK_TOKEN_LEEWAY:
+                    expires_epoch = now + expires_in
+                else:
+                    token_exp = decode_jwt_payload(access_token).get("exp")
+                    if not isinstance(token_exp, bool) \
+                            and isinstance(token_exp, (int, float)) \
+                            and math.isfinite(token_exp) \
+                            and token_exp > now + GROK_TOKEN_LEEWAY:
+                        expires_epoch = token_exp
+                if expires_epoch is None:
+                    return False
+                updated = dict(auth)
+                updated.update({
+                    "key": access_token,
+                    "refresh_token": rotated,
+                    "expires_at": datetime.fromtimestamp(
+                        expires_epoch, timezone.utc
+                    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                })
+                data[scope] = updated
+                paths.write_json_atomic(auth_path, data)
+                return True
+    except (OSError, ValueError, OverflowError, urllib.error.URLError):
+        return False
 
 
 def grok_expires_at(auth):
@@ -969,19 +1117,20 @@ def _grok_parse_credits(payload):
 def grok_limits(home, opener=open_authenticated, now=None):
     """Live weekly usage for a Grok seat via the Build billing gRPC-web endpoint.
 
-    Read-only and metadata-only: no inference tokens spent, the credential is
-    never written or refreshed. Returns a windows payload with exactly one
-    weekly (``7d``) window — Grok has no 5h limit, so none is fabricated. Holds
-    fail-closed with a distinct code on an expired bearer (BEFORE any network),
-    an auth rejection, or an unparseable/absent weekly period."""
+    This usage read itself is read-only and metadata-only. The collector may
+    refresh an expiring Headroom-owned home before calling it; adopted homes
+    never take that path. Returns exactly one weekly (``7d``) window — Grok has
+    no 5h limit, so none is fabricated. Holds fail-closed with a distinct code
+    on an expired bearer (BEFORE any usage network call), an auth rejection, or
+    an unparseable/absent weekly period."""
     now = time.time() if now is None else now
     auth = grok_auth(home)
     if not auth or not auth.get("key"):
         raise IdentityBindingError("grok_local_binding_missing")
-    # headroom never refreshes credentials (racing the CLI's own rotation could
-    # invalidate its session), so a bearer already past — or about to reach —
-    # its expiry would only 401 below. Hold with an actionable code and spend no
-    # network round-trip. A missing/malformed expires_at reads as expired too.
+    # The collector preflight already tried an eligible owned-home refresh. At
+    # this point an expired bearer is adopted, unrefreshable, or a failed
+    # refresh; hold before the usage request. Missing/malformed expiry fails
+    # closed in the same way.
     expires_at = grok_expires_at(auth)
     if expires_at is None or expires_at <= now + GROK_TOKEN_LEEWAY:
         raise IdentityBindingError("grok_token_expired")
@@ -1025,7 +1174,10 @@ def grok_limits(home, opener=open_authenticated, now=None):
         raise IdentityBindingError("grok_missing_weekly")
     try:
         percent, resets_at = _grok_parse_credits(payload)
-    except (ValueError, KeyError) as error:
+        percent = float(percent)
+        if not math.isfinite(percent) or not 0 <= percent <= 100:
+            raise ValueError("invalid Grok usage percent")
+    except (TypeError, ValueError, KeyError) as error:
         raise IdentityBindingError("grok_missing_weekly") from error
     return {
         "captured_at": int(now),
@@ -1033,7 +1185,7 @@ def grok_limits(home, opener=open_authenticated, now=None):
         "stale": False,
         "windows": {
             "7d": {
-                "used_percent": round(float(percent), 1),
+                "used_percent": round(percent, 1),
                 "resets_at": resets_at,
                 "window_minutes": 10080,
                 "observed_at": int(now),
@@ -1406,9 +1558,9 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["ok"] = True
             elif account["provider"] == "grok":
                 # Grok: local-metadata identity (verified_local, like Claude with
-                # no `auth status`) + a live, read-only weekly reading from the
-                # Build billing endpoint. No 5h window exists, so require_5h is
-                # False and none is fabricated.
+                # no `auth status`) + a live weekly reading from the Build
+                # billing endpoint. Only isolated homes owned by Headroom may
+                # rotate an expiring token; adopted CLI homes stay read-only.
                 identity = grok_identity(account["home"])
                 identity["credential_digest"] = credential_digest(
                     "grok", account["home"])
@@ -1423,6 +1575,29 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 if expected and identity["email"] \
                         and identity["email"].lower() != expected.lower():
                     raise IdentityBindingError("slot_bound_to_unexpected_email")
+                auth = grok_auth(account["home"]) or {}
+                expires_at = grok_expires_at(auth)
+                if (expires_at is None
+                        or expires_at <= now + GROK_TOKEN_LEEWAY) \
+                        and _grok_owned_home(account["home"], account["name"]):
+                    if grok_refresh_token(
+                            account["home"], account["name"],
+                            identity["account_fingerprint"],
+                            now=now):
+                        # Bind the snapshot to the post-rotation file, and
+                        # re-check local identity in case it changed while this
+                        # collector waited for the credential lock.
+                        identity = grok_identity(account["home"])
+                        if expected and identity["email"] \
+                                and identity["email"].lower() != expected.lower():
+                            raise IdentityBindingError(
+                                "slot_bound_to_unexpected_email")
+                identity["credential_digest"] = credential_digest(
+                    "grok", account["home"])
+                result["identity"] = identity
+                result["identity_verified"] = identity["verified"]
+                result["identity_method"] = identity["method"]
+                result["email"] = identity["email"]
                 result.update(grok_limits(account["home"], now=now))
                 validate_required_windows(result["windows"], require_5h=False)
                 result["ok"] = True
