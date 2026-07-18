@@ -26,7 +26,12 @@ from . import paths, registry
 CREDENTIAL_FILES = {
     "claude": [".credentials.json", ".claude.json"],
     "codex": ["auth.json"],
+    "grok": ["auth.json"],
 }
+# Auto-detection homes for the wizard's adopt flow. Grok is intentionally absent:
+# headroom never runs the grok login, so grok slots are adopted explicitly
+# (`connect --adopt ~/.grok --provider grok`) or added via config.json, not
+# auto-offered — see connect_fresh's refusal below.
 DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
 
 
@@ -84,6 +89,8 @@ def slot_identity(provider, home):
     try:
         if provider == "claude":
             identity = collector.claude_identity(home)
+        elif provider == "grok":
+            identity = collector.grok_identity(home)
         else:
             identity = collector.codex_identity(home)
         return identity
@@ -253,6 +260,15 @@ def _interactive_login(config, name, provider, home, expected_email=None,
 
 def connect_fresh(config, name, provider, quiet=False):
     """Isolated home + interactive provider login + verify + rollback."""
+    if provider == "grok":
+        # headroom is read-only for grok (never spends tokens, never runs the
+        # grok CLI), so it cannot drive a fresh grok login. Direct the user to
+        # log in themselves and adopt the existing home instead.
+        print("headroom does not run the grok login (it reads ~/.grok "
+              "read-only). Log in with the `grok` CLI, then adopt it:\n"
+              f"  headroom connect {name} --adopt ~/.grok --provider grok",
+              file=sys.stderr)
+        return None
     if not registry.NAME_RE.fullmatch(name):
         print(f"slot name {name!r} invalid: lowercase letters, digits, - and _ "
               f"only (max 32 chars)", file=sys.stderr)

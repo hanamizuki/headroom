@@ -3155,5 +3155,85 @@ class RegistryGrokSeats(unittest.TestCase):
         self.assertEqual(registry.family_provider("grok"), "grok")
 
 
+class GrokRouting(unittest.TestCase):
+    """A healthy grok seat reports only a 7d window (no 5h). The router must
+    treat grok as a no-5h provider (like codex — see registry.NO_5H_PROVIDERS)
+    and route it, not reject the row as '5h window missing'."""
+
+    def setUp(self):
+        self.now = time.time()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        # isolate reserve_percent() from the real ~/.headroom config
+        self.env = mock.patch.dict(os.environ, {"HEADROOM_DIR": self.temp.name})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        # the router re-derives the slot's live identity+credential; return the
+        # fixture's bound values so the binding matches
+        self.binding = mock.patch.object(
+            collect, "local_binding", return_value=("AAAA", "BBBB"))
+        self.binding.start()
+        self.addCleanup(self.binding.stop)
+
+    def _row(self, **over):
+        row = {
+            "name": "g", "provider": "grok", "plan": "Grok", "ok": True,
+            "stale": False, "routable": True, "identity_verified": False,
+            "identity": {"account_fingerprint": "AAAA",
+                         "credential_digest": "BBBB"},
+            "trust_state": "verified_local", "captured_at": self.now - 10,
+            "source": "grok_build_billing",
+            "windows": {"7d": {"used_percent": 50.0,
+                               "resets_at": self.now + 8 * 86400,
+                               "window_minutes": 10080,
+                               "observed_at": self.now - 10,
+                               "freshness": "fresh"}},
+        }
+        row.update(over)
+        return row
+
+    def test_seven_day_only_routes(self):
+        # no 5h window present — must NOT be rejected as "5h window missing"
+        self.assertIsNone(route.block_reason(
+            _account("g", "grok"), "grok", self._row(), {}, self.now))
+
+    def test_missing_weekly_still_holds(self):
+        row = self._row()
+        row["windows"] = {}  # 7d stays mandatory for every provider
+        reason = route.block_reason(_account("g", "grok"), "grok", row, {},
+                                    self.now)
+        self.assertIsNotNone(reason)
+        self.assertIn("7d window missing", reason)
+
+    def test_score_uses_weekly_when_5h_absent(self):
+        # _headroom_score scores on the present windows; an absent 5h is skipped
+        # for a no-5h provider, so a 50%-used weekly scores 50.0 left
+        self.assertEqual(route._headroom_score(self._row()), 50.0)
+
+
+class GrokConnect(unittest.TestCase):
+    """`grok` is in registry.PROVIDERS, so the connect CLI must handle it
+    coherently: a fresh login is refused (headroom never runs the grok CLI),
+    while adopting an existing ~/.grok reads its local identity."""
+
+    def test_fresh_connect_refused_with_adopt_guidance(self):
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            result = connect.connect_fresh({"accounts": []}, "g", "grok")
+        self.assertIsNone(result)  # refused, never spawned a login
+        self.assertIn("--adopt", buffer.getvalue())
+        self.assertIn("grok", buffer.getvalue().lower())
+
+    def test_slot_identity_reads_grok_for_adopt(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, "auth.json"), "w") as handle:
+                json.dump({"https://auth.x.ai::client": dict(_GROK_AUTH)},
+                          handle)
+            identity = connect.slot_identity("grok", home)
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity["email"], "me@x.ai")
+        self.assertEqual(identity["method"], "grok_local_metadata")
+
+
 if __name__ == "__main__":
     unittest.main()

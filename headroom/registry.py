@@ -38,6 +38,14 @@ import uuid
 from . import locks, paths
 
 PROVIDERS = ("claude", "codex", "grok")
+# Providers that report NO 5h window and legitimately carry only a weekly one —
+# OpenAI lifted Codex's 5h (2026-07), and Grok exposes a single unified weekly
+# credit pool. Their absent 5h is a lifted/absent limit, NOT a failed read, so
+# the collector (validate_required_windows require_5h=False), the router
+# (block_reason / score_account), and the widget/dashboard projections all treat
+# it as optional. For every other provider a missing 5h fails closed. The
+# dashboard mirrors this set in its JS no5h() helper.
+NO_5H_PROVIDERS = ("codex", "grok")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
 VIRTUAL_ID_RE = re.compile(r"^x-[0-9a-f]{24}$")

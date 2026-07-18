@@ -11,17 +11,12 @@ import time
 import unicodedata
 from urllib.parse import urlsplit
 
-from . import paths
+from . import paths, registry
 
 
 SCHEMA = "headroom_widget@1"
 TEXT_SCHEMA = "headroom_widget_txt@1"
 WINDOW_KEYS = ("5h", "7d")
-# Providers that legitimately report NO 5h window: OpenAI lifted Codex's 5h
-# (only weekly remains) and Grok exposes a single unified weekly pool. For any
-# other provider an absent 5h is a failed read that projects held (fail-closed).
-# Keep in sync with the dashboard's no5h() helper in dashboard/template.html.
-NO_5H_PROVIDERS = ("codex", "grok")
 SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
 OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 DASHBOARD_HREF = "http://127.0.0.1:8377/"
@@ -198,7 +193,7 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
             # that must project held, and the weekly (7d) stays mandatory for
             # everyone: a missing 7d still holds the seat.
             if (key == "5h" and key not in raw_windows and base_state != "held"
-                    and raw.get("provider") in NO_5H_PROVIDERS):
+                    and raw.get("provider") in registry.NO_5H_PROVIDERS):
                 continue
             windows[key] = _window_projection(raw_window, captured_at,
                                               base_state, evaluated_at)

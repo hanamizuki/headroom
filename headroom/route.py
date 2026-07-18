@@ -533,18 +533,20 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     windows = snapshot_row.get("windows")
     if not isinstance(windows, dict):
         return "windows invalid"
-    # OpenAI lifted Codex's 5h (2026-07): a live codex seat reports only the
-    # weekly window, so an absent 5h is a lifted limit, not a missing reading.
-    # Skip it for codex; the weekly (7d) stays mandatory for every provider,
-    # and a non-codex seat missing any standard window still holds (fail-closed).
-    codex = account.get("provider") == "codex"
+    # Some providers report NO 5h window and legitimately carry only a weekly one
+    # (codex — OpenAI lifted its 5h in 2026-07; grok — one unified weekly pool;
+    # see registry.NO_5H_PROVIDERS). Their absent 5h is a lifted/absent limit, not
+    # a missing reading — skip it. The weekly (7d) stays mandatory for every
+    # provider, and any other seat missing a standard window still holds
+    # (fail-closed).
+    no_5h = account.get("provider") in registry.NO_5H_PROVIDERS
     for key in ("5h", "7d"):
         window = windows.get(key)
         if not isinstance(window, dict):
             # Only a genuinely ABSENT 5h is the lifted limit. A PRESENT but
             # malformed 5h ("5h": null / a string, i.e. a corrupt or partially
             # written snapshot) is not lifted — fail closed and hold.
-            if key == "5h" and codex and key not in windows:
+            if key == "5h" and no_5h and key not in windows:
                 continue
             return f"{key} window missing"
         percent = window.get("used_percent")
@@ -647,16 +649,17 @@ def _headroom_score(row):
     windows = row.get("windows") if isinstance(row, dict) else None
     if not isinstance(windows, dict):
         return -1.0
-    # 5h is optional for codex (OpenAI lifted it): score on whatever standard
-    # windows are present. Reachable for codex now that block_reason no longer
-    # blocks an absent 5h. 7d stays required — its absence, or any unreadable
-    # percent, scores worst (fail-closed ordering).
-    codex = row.get("provider") == "codex"
+    # 5h is optional for the no-5h providers (codex, grok — see
+    # registry.NO_5H_PROVIDERS): score on whatever standard windows are present,
+    # reachable now that block_reason no longer blocks their absent 5h. 7d stays
+    # required — its absence, or any unreadable percent, scores worst
+    # (fail-closed ordering).
+    no_5h = row.get("provider") in registry.NO_5H_PROVIDERS
     values = []
     for key in ("5h", "7d"):
         window = windows.get(key)
         if not isinstance(window, dict):
-            if key == "5h" and codex:
+            if key == "5h" and no_5h:
                 continue
             return -1.0
         percent = window.get("used_percent")
