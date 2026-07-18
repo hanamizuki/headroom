@@ -1280,9 +1280,13 @@ def cmd_rotate(fam):
         if earliest:
             print(f"earliest 5h reset: {tfmt(earliest)}")
         return 2
-    reset = window_reset(snapshot, current["name"], "5h") \
-        or time.time() + 5 * 3600
-    reset = mark(current["name"], fam, reset, account_wide=True)
+    # cool against the window this provider actually resets on: no-5h providers
+    # (codex/grok) have only a weekly window, so a 5h fallback would re-offer an
+    # exhausted seat far too early (grok's pool resets weekly, not in 5 hours)
+    window = "7d" if current["provider"] in registry.NO_5H_PROVIDERS else "5h"
+    reset = window_reset(snapshot, current["name"], window) \
+        or time.time() + (7 * 86400 if window == "7d" else 5 * 3600)
+    reset = mark(current["name"], fam, reset, account_wide=True, window=window)
     successor = pick(fam)
     if successor is None:
         print(f"rotated {current['name']} out (cools until {tfmt(reset)}) — "

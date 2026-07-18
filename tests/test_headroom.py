@@ -3240,6 +3240,22 @@ class GrokRouting(unittest.TestCase):
             rc = route._exec_routed("grok", ["grok"])
         self.assertEqual(rc, 2)
 
+    def test_rotate_cools_grok_for_the_weekly_window(self):
+        # a grok seat resets weekly, so cooling it must use the 7d window — a
+        # +5h fallback would re-offer an exhausted pool far too early
+        grok = _account("g", "grok")
+        with mock.patch.object(route, "ensure_fresh_snapshot", return_value={}), \
+                mock.patch.object(route, "candidates",
+                                  return_value=[(grok, None)]), \
+                mock.patch.object(route, "current_account", return_value=grok), \
+                mock.patch.object(route, "window_reset", return_value=None), \
+                mock.patch.object(route, "pick", return_value=None), \
+                redirect_stdout(io.StringIO()):
+            route.cmd_rotate("grok")
+        reset = (route.cooldowns() or {}).get("g:*")
+        self.assertIsNotNone(reset)
+        self.assertGreater(reset - self.now, 6 * 86400)  # ~weekly, not 5h
+
 
 class GrokConnect(unittest.TestCase):
     """`grok` is in registry.PROVIDERS, so the connect CLI must handle it
