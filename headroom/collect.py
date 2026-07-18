@@ -1580,18 +1580,29 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 if (expires_at is None
                         or expires_at <= now + GROK_TOKEN_LEEWAY) \
                         and _grok_owned_home(account["home"], account["name"]):
-                    if grok_refresh_token(
-                            account["home"], account["name"],
-                            identity["account_fingerprint"],
-                            now=now):
-                        # Bind the snapshot to the post-rotation file, and
-                        # re-check local identity in case it changed while this
-                        # collector waited for the credential lock.
-                        identity = grok_identity(account["home"])
-                        if expected and identity["email"] \
-                                and identity["email"].lower() != expected.lower():
-                            raise IdentityBindingError(
-                                "slot_bound_to_unexpected_email")
+                    # Attempt rotation. Success or failure both re-bind identity
+                    # from disk: when a concurrent re-login swaps the seat,
+                    # grok_refresh_token fails closed on fingerprint mismatch
+                    # and returns False. Without a re-read here the collector
+                    # would keep the preflight email/fingerprint, recompute
+                    # credential_digest for the new bearer, and publish the
+                    # new account's usage under the old identity — Grok billing
+                    # has no identity header to catch the swap.
+                    grok_refresh_token(
+                        account["home"], account["name"],
+                        identity["account_fingerprint"],
+                        now=now)
+                    identity = grok_identity(account["home"])
+                    # Publish the post-attempt seat on the result before any
+                    # expected-email hold so the held row names the real login.
+                    result["identity"] = identity
+                    result["identity_verified"] = identity["verified"]
+                    result["identity_method"] = identity["method"]
+                    result["email"] = identity["email"]
+                    if expected and identity["email"] \
+                            and identity["email"].lower() != expected.lower():
+                        raise IdentityBindingError(
+                            "slot_bound_to_unexpected_email")
                 identity["credential_digest"] = credential_digest(
                     "grok", account["home"])
                 result["identity"] = identity

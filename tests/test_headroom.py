@@ -3438,6 +3438,90 @@ class GrokCollect(unittest.TestCase):
             row["identity"]["credential_digest"],
             hashlib.sha256(b"new-bearer").hexdigest()[:16])
 
+    def test_failed_refresh_rebinds_identity_before_usage(self):
+        """A concurrent re-login can swap the seat while refresh fails closed.
+
+        ``grok_refresh_token`` returns False on fingerprint mismatch. The
+        collector must still re-read identity before ``grok_limits`` so the
+        new bearer's usage is never published under the preflight seat —
+        Grok billing has no identity header to catch the swap.
+        """
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            auth_path = os.path.join(home, "auth.json")
+            preflight = dict(
+                _GROK_AUTH, email="a@x.ai", user_id="u-a",
+                oidc_client_id="client-uuid", key="a-old",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            swapped = dict(
+                _GROK_AUTH, email="b@x.ai", user_id="u-b",
+                oidc_client_id="client-uuid", key="b-new",
+                expires_at="2999-01-01T00:00:00.000000Z")
+            with open(auth_path, "w") as handle:
+                json.dump({_GROK_SCOPE: preflight}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+
+            def refresh(_home, _slot_name, _fingerprint, now=None):
+                with open(auth_path, "w") as handle:
+                    json.dump({_GROK_SCOPE: swapped}, handle)
+                return False  # fingerprint mismatch under the lock
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token",
+                                      side_effect=refresh) as refresh_mock, \
+                    mock.patch.object(collect, "grok_limits",
+                                      return_value=self._windows()):
+                row = collect.collect([account])["accounts"][0]
+
+        refresh_mock.assert_called_once_with(
+            home, "g", collect.fingerprint("u-a:t-1"), now=mock.ANY)
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["email"], "b@x.ai")
+        self.assertEqual(
+            row["identity"]["account_fingerprint"],
+            collect.fingerprint("u-b:t-1"))
+        self.assertEqual(
+            row["identity"]["credential_digest"],
+            hashlib.sha256(b"b-new").hexdigest()[:16])
+
+    def test_failed_refresh_identity_swap_respects_expected_email(self):
+        """Same race as above, with expected_email: hold on the post-swap seat."""
+        with tempfile.TemporaryDirectory() as headroom:
+            home = os.path.join(headroom, "homes", "g")
+            os.makedirs(home)
+            auth_path = os.path.join(home, "auth.json")
+            preflight = dict(
+                _GROK_AUTH, email="a@x.ai", user_id="u-a",
+                oidc_client_id="client-uuid", key="a-old",
+                expires_at="2000-01-01T00:00:00.000000Z")
+            swapped = dict(
+                _GROK_AUTH, email="b@x.ai", user_id="u-b",
+                oidc_client_id="client-uuid", key="b-new",
+                expires_at="2999-01-01T00:00:00.000000Z")
+            with open(auth_path, "w") as handle:
+                json.dump({_GROK_SCOPE: preflight}, handle)
+            account = _account("g", "grok")
+            account["home"] = home
+            account["expected_email"] = "a@x.ai"
+
+            def refresh(_home, _slot_name, _fingerprint, now=None):
+                with open(auth_path, "w") as handle:
+                    json.dump({_GROK_SCOPE: swapped}, handle)
+                return False
+
+            with mock.patch.dict(os.environ, {"HEADROOM_DIR": headroom}), \
+                    mock.patch.object(collect, "grok_refresh_token",
+                                      side_effect=refresh), \
+                    mock.patch.object(collect, "grok_limits") as limits_mock:
+                row = collect.collect([account])["accounts"][0]
+
+        limits_mock.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "slot_bound_to_unexpected_email")
+        self.assertEqual(row["email"], "b@x.ai")
+
     def test_unexpected_owned_identity_holds_before_refresh(self):
         with tempfile.TemporaryDirectory() as headroom:
             home = os.path.join(headroom, "homes", "g")
