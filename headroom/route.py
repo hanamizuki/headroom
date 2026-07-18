@@ -713,6 +713,12 @@ def pick(fam):
 # location. The launcher exports <env var>=<slot home> so the CLI loads the
 # routed account's isolated config rather than the ambient login. Unknown
 # providers keep the historical CODEX_HOME/~/.codex fallback.
+#
+# Grok is monitor + route only, never launched by headroom: `headroom env/pick
+# grok` emit GROK_HOME so the user runs the grok CLI themselves, but there is
+# DELIBERATELY no `headroom grok` launch command — spawning the grok binary
+# would violate the read-only, zero-token-spend contract. Claude/Codex remain
+# the only providers headroom exec()s.
 PROVIDER_HOME_ENV = {
     "claude": "CLAUDE_CONFIG_DIR",
     "codex": "CODEX_HOME",

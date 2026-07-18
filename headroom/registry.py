@@ -46,6 +46,12 @@ PROVIDERS = ("claude", "codex", "grok")
 # it as optional. For every other provider a missing 5h fails closed. The
 # dashboard mirrors this set in its JS no5h() helper.
 NO_5H_PROVIDERS = ("codex", "grok")
+# Providers with a local per-session token-log format the token scanner can read
+# (Claude's projects/*.jsonl, Codex's sessions/rollout-*.jsonl). Grok is absent:
+# its usage is a server-side weekly pool with no per-session token counts, so it
+# never participates in token telemetry (scanning it as Codex would only mark the
+# feed partial/failed). token_accounts() enforces this.
+TOKEN_LOG_PROVIDERS = ("claude", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
 VIRTUAL_ID_RE = re.compile(r"^x-[0-9a-f]{24}$")
@@ -252,10 +258,16 @@ def token_extra_roots(config=None, include_status=False):
 
 
 def token_accounts(config=None, include_status=False):
-    """Registry slots plus virtual extra roots for token scanning and feeds."""
+    """Registry slots plus virtual extra roots for token scanning and feeds.
+
+    Only providers with a local per-session token-log format participate — a
+    grok slot (no such logs) is excluded so the scanner never treats it as Codex
+    and marks the token feed partial/failed on every run."""
     config = load() if config is None else config
     extra, partial = token_extra_roots(config, include_status=True)
-    result = accounts(config) + extra
+    scannable = [account for account in accounts(config)
+                 if account["provider"] in TOKEN_LOG_PROVIDERS]
+    result = scannable + extra
     return (result, partial) if include_status else result
 
 

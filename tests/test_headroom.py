@@ -3154,6 +3154,18 @@ class RegistryGrokSeats(unittest.TestCase):
         self.assertEqual(registry.family("grok"), "grok")
         self.assertEqual(registry.family_provider("grok"), "grok")
 
+    def test_grok_excluded_from_token_scanning(self):
+        # grok has no local per-session token logs; it must not be fed to the
+        # token scanner (which would treat it as codex and mark the feed partial)
+        config = {"schema_version": 1, "accounts": [
+            {"name": "c", "provider": "claude", "home": "~/.claude"},
+            {"name": "x", "provider": "codex", "home": "~/.codex"},
+            {"name": "g", "provider": "grok", "home": "~/.grok"},
+        ]}
+        providers = {account["provider"]
+                     for account in registry.token_accounts(config)}
+        self.assertEqual(providers, {"claude", "codex"})
+
 
 class GrokRouting(unittest.TestCase):
     """A healthy grok seat reports only a 7d window (no 5h). The router must
