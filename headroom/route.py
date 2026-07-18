@@ -686,10 +686,11 @@ def candidates(fam, snapshot=_UNSET):
         else:
             reason = block_reason(account, fam, rows.get(account["name"]),
                                   cool, now, reserve=reserve)
-        # Greatest-headroom ordering is scoped to Codex for now (Paul 2026-07-14):
-        # Claude keeps its established registry-order preference so daily Claude
-        # routing is unchanged; Codex picks the account with the most proven room.
-        greatest_headroom = registry.family_provider(fam) == "codex"
+        # Greatest-headroom ordering: Claude keeps its established registry-order
+        # preference so daily Claude routing is unchanged; the usage-metered
+        # pools (Codex, Grok) pick the account with the most proven weekly room,
+        # so a nearly-exhausted seat is never chosen ahead of a fuller one.
+        greatest_headroom = registry.family_provider(fam) in ("codex", "grok")
         score = _headroom_score(rows.get(account["name"])) \
             if (reason is None and greatest_headroom) else None
         ranked.append((account, reason, index, score))

@@ -1549,6 +1549,22 @@ def _codex_account(name="cx", **over):
     return account
 
 
+def _grok_row(name="g", used7d=20.0, **over):
+    now = int(time.time())
+    row = {
+        "name": name, "provider": "grok", "plan": "Grok", "ok": True,
+        "stale": False, "routable": True, "identity_verified": False,
+        "identity": {"account_fingerprint": "AAAA", "credential_digest": "BBBB"},
+        "trust_state": "verified_local", "captured_at": now - 10,
+        "source": "grok_build_billing",
+        "windows": {"7d": {"used_percent": used7d, "resets_at": now + 8 * 86400,
+                           "window_minutes": 10080, "observed_at": now - 10,
+                           "freshness": "fresh"}},
+    }
+    row.update(over)
+    return row
+
+
 class CodexBlockReasonFailClosed(unittest.TestCase):
     """Codex eligibility is stricter than Claude's and fully provider-gated:
     live app-server source, network-verified identity, ChatGPT subscription
@@ -1728,6 +1744,15 @@ class GreatestHeadroom(unittest.TestCase):
         ranked = self.ranked("codex", accounts, rows)
         self.assertEqual([a["name"] for a, r in ranked if r is None],
                          ["cx2", "cx1"])
+
+    def test_grok_picks_greatest_weekly_headroom(self):
+        # grok is a weekly-metered pool like codex: the seat with the most 7d
+        # room wins even when a nearly-exhausted seat is earlier in the registry
+        accounts = [_account("g1", "grok"), _account("g2", "grok")]
+        rows = [_grok_row("g1", used7d=80.0), _grok_row("g2", used7d=20.0)]
+        ranked = self.ranked("grok", accounts, rows)
+        self.assertEqual([a["name"] for a, r in ranked if r is None],
+                         ["g2", "g1"])
 
     def test_score_is_min_of_both_windows(self):
         # cx1: 5h says 90 free but 7d only 5 free -> score 5; cx2 -> score 40
