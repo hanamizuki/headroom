@@ -714,11 +714,13 @@ def pick(fam):
 # routed account's isolated config rather than the ambient login. Unknown
 # providers keep the historical CODEX_HOME/~/.codex fallback.
 #
-# Grok is monitor + route only, never launched by headroom: `headroom env/pick
-# grok` emit GROK_HOME so the user runs the grok CLI themselves, but there is
-# DELIBERATELY no `headroom grok` launch command — spawning the grok binary
-# would violate the read-only, zero-token-spend contract. Claude/Codex remain
-# the only providers headroom exec()s.
+# Grok is monitor + env/pick only, never launched by headroom: `headroom env/
+# pick grok` emit GROK_HOME so the user runs the grok CLI themselves, but every
+# exec path (`headroom run grok`, and the launch path) refuses a grok family via
+# _grok_launch_refused() — spawning a process on a grok seat could spend credits
+# or refresh its token, violating the read-only contract. There is also no
+# `headroom grok` launch command. Claude/Codex remain the only providers
+# headroom exec()s.
 PROVIDER_HOME_ENV = {
     "claude": "CLAUDE_CONFIG_DIR",
     "codex": "CODEX_HOME",
@@ -972,7 +974,24 @@ def cmd_status(fam):
     return 0 if chosen else 2
 
 
+def _grok_launch_refused(fam):
+    """Grok is monitor + env/pick only: headroom must never spawn a process on a
+    grok seat (running the grok CLI could spend credits or trigger a credential
+    refresh — the read-only, zero-token-spend contract forbids it). Prints an
+    actionable message and returns True when ``fam`` routes to grok, so every
+    exec path can refuse early. Routing/monitoring still work: use
+    ``headroom env grok`` to get GROK_HOME, then launch the grok CLI yourself."""
+    if registry.family_provider(fam) == "grok":
+        print("[headroom] headroom does not launch grok (read-only, no token "
+              "spend) — use `headroom env grok` to route, then run grok "
+              "yourself", file=sys.stderr)
+        return True
+    return False
+
+
 def cmd_run(fam, command):
+    if _grok_launch_refused(fam):
+        return 2
     snapshot = ensure_fresh_snapshot()
     rows = _snapshot_accounts(snapshot)
     for account, reason in candidates(fam, snapshot):
@@ -1130,6 +1149,8 @@ def cmd_exec(fam, command, launch_note="", fallback=False):
 
 
 def _exec_routed(fam, command, launch_note=""):
+    if _grok_launch_refused(fam):
+        return 2
     if registry.family_provider(fam) == "codex" and not CODEX_ROUTING_ENABLED:
         # fail-closed: disabled routing means headroom REFUSES to launch a
         # Codex seat it cannot prove capacity for — never "just take the

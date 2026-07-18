@@ -3225,6 +3225,21 @@ class GrokRouting(unittest.TestCase):
         # for a no-5h provider, so a 50%-used weekly scores 50.0 left
         self.assertEqual(route._headroom_score(self._row()), 50.0)
 
+    def test_run_refuses_grok(self):
+        # grok is monitor/env-pick only: `headroom run grok` must never spawn a
+        # process on a grok seat (read-only, no token spend)
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            rc = route.cmd_run("grok", ["/bin/echo", "hi"])
+        self.assertEqual(rc, 2)
+        self.assertIn("does not launch grok", buffer.getvalue())
+
+    def test_exec_routed_refuses_grok(self):
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            rc = route._exec_routed("grok", ["grok"])
+        self.assertEqual(rc, 2)
+
 
 class GrokConnect(unittest.TestCase):
     """`grok` is in registry.PROVIDERS, so the connect CLI must handle it
