@@ -706,8 +706,24 @@ def pick(fam):
     return None
 
 
+# The config-home environment variable each provider CLI reads, and its default
+# location. The launcher exports <env var>=<slot home> so the CLI loads the
+# routed account's isolated config rather than the ambient login. Unknown
+# providers keep the historical CODEX_HOME/~/.codex fallback.
+PROVIDER_HOME_ENV = {
+    "claude": "CLAUDE_CONFIG_DIR",
+    "codex": "CODEX_HOME",
+    "grok": "GROK_HOME",
+}
+PROVIDER_HOME_DEFAULT = {
+    "claude": "~/.claude",
+    "codex": "~/.codex",
+    "grok": "~/.grok",
+}
+
+
 def env_key(account):
-    return "CLAUDE_CONFIG_DIR" if account["provider"] == "claude" else "CODEX_HOME"
+    return PROVIDER_HOME_ENV.get(account["provider"], "CODEX_HOME")
 
 
 def env_pinned_account(fam):
@@ -722,7 +738,7 @@ def env_pinned_account(fam):
     try:
         provider = registry.family_provider(fam)
         value = os.environ.get(
-            "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME", "")
+            PROVIDER_HOME_ENV.get(provider, "CODEX_HOME"), "")
         value = value.strip()
         if not value:
             return None
@@ -1201,8 +1217,8 @@ def _exec_routed(fam, command, launch_note=""):
 def current_account(fam):
     """The registry account this process's environment actually points at."""
     provider = registry.family_provider(fam)
-    var = "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"
-    default = "~/.claude" if provider == "claude" else "~/.codex"
+    var = PROVIDER_HOME_ENV.get(provider, "CODEX_HOME")
+    default = PROVIDER_HOME_DEFAULT.get(provider, "~/.codex")
     home = os.path.realpath(os.path.expanduser(os.environ.get(var, default)))
     try:
         for account in registry.ordered_for(fam):

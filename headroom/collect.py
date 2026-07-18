@@ -11,6 +11,13 @@ Codex: read live from the Codex app-server (``codex app-server`` ->
 CODEX_HOME. Falls back to on-disk ``rate_limits`` session telemetry only when
 the app-server is unavailable (older Codex CLI). No inference tokens spent.
 
+Grok (xAI SuperGrok / X Premium+): read the subscription's unified weekly pool
+from the Grok Build billing endpoint (``GrokBuildBilling/GetGrokCreditsConfig``,
+a metadata-only gRPC-web call) using the Grok CLI's own local bearer in each
+slot's ``GROK_HOME``/``~/.grok/auth.json``. Read-only: never refreshes or writes
+the credential, never spends tokens. An expired bearer fails closed (hold) with
+an actionable note — running the ``grok`` CLI once refreshes its own token.
+
 Fail-closed rules:
   * an account with unverifiable identity or an out-of-range reading is HELD
     (ok=false) rather than guessed at;
@@ -29,6 +36,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -307,6 +315,9 @@ def credential_digest(provider, home):
     try:
         if provider == "claude":
             token = (claude_oauth(home) or {}).get("accessToken")
+        elif provider == "grok":
+            # grok_auth is defined later in this module; resolved at call time
+            token = (grok_auth(home) or {}).get("key")
         else:
             token = ((paths.load_json(os.path.join(home, "auth.json")) or {})
                      .get("tokens") or {}).get("access_token")
@@ -322,6 +333,8 @@ def local_binding(provider, home):
     try:
         if provider == "claude":
             fp = claude_local_identity(home)["account_fingerprint"]
+        elif provider == "grok":
+            fp = grok_identity(home)["account_fingerprint"]
         else:
             auth = paths.load_json(os.path.join(home, "auth.json")) or {}
             claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
@@ -737,6 +750,282 @@ def codex_subscription(provider_claims, now=None):
     }
 
 
+# -------------------------------------------------------------------- grok
+#
+# Grok (xAI SuperGrok / X Premium+) exposes ONE unified weekly credit pool.
+# Its Build CLI keeps a local OIDC bearer in ``<GROK_HOME>/auth.json``; we read
+# usage from the Build billing endpoint with that bearer and NEVER refresh or
+# write it. The endpoint speaks gRPC-web (protobuf framed over HTTP/1.1), so a
+# tiny stdlib reader below decodes the wire types the response uses (varint +
+# length-delimited messages, plus the fixed32 float carrying the used-percent).
+# Pulling in a protobuf/grpc dependency for three fields would break headroom's
+# zero-dependency, stdlib-only contract.
+
+GROK_USAGE_URL = ("https://grok.com/grok_api_v2.GrokBuildBilling/"
+                  "GetGrokCreditsConfig")
+# a bearer within this many seconds of expiry is treated as already expired:
+# headroom never refreshes, so a token about to lapse would 401 mid-flight
+GROK_TOKEN_LEEWAY = 60
+GROK_HOLD_NOTES = {
+    "grok_local_binding_missing": (
+        "no Grok login in this slot (missing ~/.grok/auth.json, or it lacks an "
+        "email/user_id) — run the `grok` CLI once to log in; seat held"),
+    "grok_token_expired": (
+        "Grok bearer expired — headroom never refreshes credentials. Run the "
+        "`grok` CLI once (it refreshes its own token); reading held until then"),
+    "grok_usage_rejected": (
+        "Grok billing endpoint rejected the token (expired or revoked) — run "
+        "the `grok` CLI once to refresh it; seat held"),
+    "grok_missing_weekly": (
+        "Grok billing returned no usable weekly period; seat held (no reading "
+        "guessed)"),
+}
+
+
+def grok_auth(home):
+    """The single credential object from a Grok CLI ``auth.json``.
+
+    The file's top level maps ONE OIDC scope-URL key
+    (``https://auth.x.ai::<client-uuid>``) to the credential object; take the
+    first dict value. None when the file is missing/unreadable or carries no
+    object value (callers then fail closed)."""
+    data = paths.load_json(os.path.join(home, "auth.json"))
+    if not isinstance(data, dict):
+        return None
+    return next((value for value in data.values()
+                 if isinstance(value, dict)), None)
+
+
+def grok_expires_at(auth):
+    """Epoch seconds for the bearer's expiry from ``auth.json``'s RFC 3339
+    ``expires_at`` (microseconds + ``Z``). None when absent/malformed — the
+    caller treats that as already expired (fail closed)."""
+    raw = auth.get("expires_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def grok_identity(home):
+    """Identity bound in the slot from ``auth.json`` metadata only (no network)
+    — same local-metadata trust level as ``claude_local_identity`` (``verified``
+    is False). The fingerprint is the seat-composite ``user_id:team_id`` when a
+    team is present, else the bare ``user_id``; the composite always contains a
+    ``:`` and a bare UUID never does, so the two forms can never collide."""
+    auth = grok_auth(home) or {}
+    email = auth.get("email")
+    user_id = auth.get("user_id")
+    if not email or not user_id:
+        raise IdentityBindingError("grok_local_binding_missing")
+    team_id = auth.get("team_id")
+    seat = f"{user_id}:{team_id}" if team_id else user_id
+    return {
+        "verified": False,
+        "email": email,
+        "account_fingerprint": fingerprint(seat),
+        "method": "grok_local_metadata",
+        "plan_type": None,
+    }
+
+
+# -- minimal protobuf / gRPC-web reader (stdlib only) -----------------------
+
+def _grok_read_varint(buf, pos):
+    """Decode a base-128 varint at ``buf[pos:]``; return (value, next_pos)."""
+    result = shift = 0
+    while True:
+        if pos >= len(buf):
+            raise ValueError("truncated varint")
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("varint too long")
+
+
+def _grok_iter_fields(buf):
+    """Yield ``(field_number, wire_type, value)`` for each protobuf field in
+    ``buf``. value is int (varint/fixed64), float (fixed32) or bytes
+    (length-delimited). Deprecated group wire types raise (fail closed)."""
+    pos, size = 0, len(buf)
+    while pos < size:
+        tag, pos = _grok_read_varint(buf, pos)
+        field, wire = tag >> 3, tag & 0x07
+        if wire == 0:  # varint
+            value, pos = _grok_read_varint(buf, pos)
+        elif wire == 2:  # length-delimited (nested message / bytes / string)
+            length, pos = _grok_read_varint(buf, pos)
+            if pos + length > size:
+                raise ValueError("truncated length-delimited field")
+            value, pos = buf[pos:pos + length], pos + length
+        elif wire == 5:  # 32-bit — the credits percent is an IEEE-754 float
+            if pos + 4 > size:
+                raise ValueError("truncated fixed32")
+            value, pos = struct.unpack("<f", buf[pos:pos + 4])[0], pos + 4
+        elif wire == 1:  # 64-bit — unused by this message, skipped intact
+            if pos + 8 > size:
+                raise ValueError("truncated fixed64")
+            value, pos = struct.unpack("<Q", buf[pos:pos + 8])[0], pos + 8
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire}")
+        yield field, wire, value
+
+
+def _grok_grpc_frames(body):
+    """Split a gRPC-web response body into ``(flag, payload)`` frames — each a
+    1-byte flag, a 4-byte big-endian length, then that many payload bytes."""
+    frames, pos, size = [], 0, len(body)
+    while pos + 5 <= size:
+        flag = body[pos]
+        length = int.from_bytes(body[pos + 1:pos + 5], "big")
+        pos += 5
+        if pos + length > size:
+            raise ValueError("truncated gRPC-web frame")
+        frames.append((flag, body[pos:pos + length]))
+        pos += length
+    return frames
+
+
+def _grok_grpc_status(frames):
+    """The integer ``grpc-status`` from the trailer frame (flag bit 0x80), or
+    None when no parseable trailer is present."""
+    for flag, payload in frames:
+        if flag & 0x80:
+            text = payload.decode("ascii", errors="ignore").replace("\r\n", "\n")
+            for line in text.split("\n"):
+                key, _, value = line.partition(":")
+                if key.strip().lower() == "grpc-status":
+                    try:
+                        return int(value.strip())
+                    except ValueError:
+                        return None
+    return None
+
+
+def _grok_timestamp_seconds(message):
+    """The ``seconds`` field (1, varint) of a protobuf Timestamp; None absent."""
+    for field, wire, value in _grok_iter_fields(message):
+        if field == 1 and wire == 0:
+            return value
+    return None
+
+
+def _grok_period_end(message):
+    """The end epoch of a ``current_period`` message (field 3 = end Timestamp),
+    or None when the period carries no end."""
+    for field, wire, value in _grok_iter_fields(message):
+        if field == 3 and wire == 2:
+            return _grok_timestamp_seconds(value)
+    return None
+
+
+def _grok_parse_credits(payload):
+    """Parse a GetGrokCreditsConfig body → ``(used_percent, resets_at)``.
+
+    Outer field 1 wraps the GrokCreditsConfig message. Inside it: field 1 is the
+    fixed32 float ``credit_usage_percent`` (proto3 omits a zero scalar, so an
+    ABSENT field means 0.0, never an error); field 8 is ``current_period`` whose
+    field 3 is the weekly end Timestamp; field 5 is the deprecated end Timestamp
+    kept only as a fallback. Raises ValueError when no config/period is found."""
+    config = None
+    for field, wire, value in _grok_iter_fields(payload):
+        if field == 1 and wire == 2:
+            config = value
+            break
+    if config is None:
+        raise ValueError("no GrokCreditsConfig in response")
+    percent = 0.0
+    period_end = deprecated_end = None
+    for field, wire, value in _grok_iter_fields(config):
+        if field == 1 and wire == 5:
+            percent = float(value)
+        elif field == 8 and wire == 2:
+            period_end = _grok_period_end(value)
+        elif field == 5 and wire == 2:
+            deprecated_end = _grok_timestamp_seconds(value)
+    resets_at = period_end if period_end is not None else deprecated_end
+    if resets_at is None:
+        raise ValueError("no weekly period end in response")
+    return percent, resets_at
+
+
+def grok_limits(home, opener=open_authenticated, now=None):
+    """Live weekly usage for a Grok seat via the Build billing gRPC-web endpoint.
+
+    Read-only and metadata-only: no inference tokens spent, the credential is
+    never written or refreshed. Returns a windows payload with exactly one
+    weekly (``7d``) window — Grok has no 5h limit, so none is fabricated. Holds
+    fail-closed with a distinct code on an expired bearer (BEFORE any network),
+    an auth rejection, or an unparseable/absent weekly period."""
+    now = time.time() if now is None else now
+    auth = grok_auth(home)
+    if not auth or not auth.get("key"):
+        raise IdentityBindingError("grok_local_binding_missing")
+    # headroom never refreshes credentials (racing the CLI's own rotation could
+    # invalidate its session), so a bearer already past — or about to reach —
+    # its expiry would only 401 below. Hold with an actionable code and spend no
+    # network round-trip. A missing/malformed expires_at reads as expired too.
+    expires_at = grok_expires_at(auth)
+    if expires_at is None or expires_at <= now + GROK_TOKEN_LEEWAY:
+        raise IdentityBindingError("grok_token_expired")
+    request = urllib.request.Request(
+        GROK_USAGE_URL,
+        data=b"\x00\x00\x00\x00\x00",  # the empty gRPC-web request frame
+        headers={
+            "authorization": "Bearer " + auth["key"],
+            "content-type": "application/grpc-web+proto",
+            # load-bearing: Cloudflare 403s urllib's default UA; any custom UA
+            # passes. This is the sole reason a User-Agent is set at all.
+            "user-agent": "headroom",
+        },
+        method="POST",
+    )
+    try:
+        with opener(request, timeout=30) as response:
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            # auth rejection is not capacity: hold with a distinct code instead
+            # of letting a raw HTTPError surface as a generic collector error
+            raise IdentityBindingError("grok_usage_rejected") from error
+        raise
+    frames = _grok_grpc_frames(body)
+    # require grpc-status:0 — a non-zero status inside an HTTP 200 is a
+    # rejection, not data, and must never be read as capacity
+    if _grok_grpc_status(frames) != 0:
+        raise IdentityBindingError("grok_usage_rejected")
+    payload = next((p for flag, p in frames if not flag & 0x80), None)
+    if payload is None:
+        raise IdentityBindingError("grok_missing_weekly")
+    try:
+        percent, resets_at = _grok_parse_credits(payload)
+    except (ValueError, KeyError) as error:
+        raise IdentityBindingError("grok_missing_weekly") from error
+    return {
+        "captured_at": int(now),
+        "source": "grok_build_billing",
+        "stale": False,
+        "windows": {
+            "7d": {
+                "used_percent": round(float(percent), 1),
+                "resets_at": resets_at,
+                "window_minutes": 10080,
+                "observed_at": int(now),
+                "freshness": "fresh",
+            }
+        },
+    }
+
+
 # ------------------------------------------------------------------ limits
 
 def limit_entry(limit, minutes):
@@ -1098,6 +1387,28 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     result["pin_usage_org"] = result["source_identity_fingerprint"]
                 validate_required_windows(result["windows"])
                 result["ok"] = True
+            elif account["provider"] == "grok":
+                # Grok: local-metadata identity (verified_local, like Claude with
+                # no `auth status`) + a live, read-only weekly reading from the
+                # Build billing endpoint. No 5h window exists, so require_5h is
+                # False and none is fabricated.
+                identity = grok_identity(account["home"])
+                identity["credential_digest"] = credential_digest(
+                    "grok", account["home"])
+                result["identity"] = identity
+                result["identity_verified"] = identity["verified"]
+                result["identity_method"] = identity["method"]
+                result["email"] = identity["email"]
+                result["plan"] = "Grok"
+                result["subscription"] = {"status": "unknown",
+                                          "source": "provider_not_exposed"}
+                expected = account.get("expected_email")
+                if expected and identity["email"] \
+                        and identity["email"].lower() != expected.lower():
+                    raise IdentityBindingError("slot_bound_to_unexpected_email")
+                result.update(grok_limits(account["home"], now=now))
+                validate_required_windows(result["windows"], require_5h=False)
+                result["ok"] = True
             else:
                 expected = account.get("expected_email")
                 codex_retry_at = active_backoff(backoff, "codex_app_server", now)
@@ -1209,6 +1520,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
             result["error_code"] = error.code
             if error.code in CODEX_HOLD_NOTES:
                 result["note"] = CODEX_HOLD_NOTES[error.code]
+            elif error.code in GROK_HOLD_NOTES:
+                result["note"] = GROK_HOLD_NOTES[error.code]
             elif error.code in ("claude_usage_token_expired",
                                 "claude_usage_token_rejected"):
                 what = ("has expired" if error.code.endswith("expired")

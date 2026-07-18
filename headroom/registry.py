@@ -37,7 +37,7 @@ import uuid
 
 from . import locks, paths
 
-PROVIDERS = ("claude", "codex")
+PROVIDERS = ("claude", "codex", "grok")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ID_RE = re.compile(r"^[0-9a-f]{12,32}$")
 VIRTUAL_ID_RE = re.compile(r"^x-[0-9a-f]{24}$")
@@ -59,6 +59,7 @@ FAMILY_PROVIDER = {
     "claude": "claude",
     "codex": "codex",
     "gpt": "codex",
+    "grok": "grok",
 }
 
 
@@ -68,7 +69,7 @@ class RegistryError(ValueError):
 
 def family(model):
     model = (model or "").lower().strip()
-    for name in ("fable", "opus", "sonnet", "haiku", "codex", "gpt"):
+    for name in ("fable", "opus", "sonnet", "haiku", "codex", "gpt", "grok"):
         if name in model:
             return "codex" if name == "gpt" else name
     if not model or "claude" in model:
@@ -76,7 +77,8 @@ def family(model):
     # An unknown model must not silently route as generic Claude — a typo'd
     # scoped model would bypass its own weekly cap.
     raise RegistryError(
-        f"unknown model family: {model!r} (use opus/sonnet/haiku/claude/codex)")
+        f"unknown model family: {model!r} "
+        "(use opus/sonnet/haiku/claude/codex/grok)")
 
 
 def family_provider(fam):
