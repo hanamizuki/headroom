@@ -136,9 +136,13 @@ def _token_extra_root_entries(config):
         if label in labels:
             raise RegistryError(f"token extra-root label duplicate: {label!r}")
         provider = entry.get("provider")
-        if provider not in PROVIDERS:
+        # extra roots exist ONLY for token scanning, so they are restricted to
+        # providers with a local token-log format — a grok extra root (no such
+        # logs) would be scanned as codex and mark the feed partial/failed
+        if provider not in TOKEN_LOG_PROVIDERS:
             raise RegistryError(
-                f"token extra-root {label}: provider must be one of {PROVIDERS}")
+                f"token extra-root {label}: provider must be one of "
+                f"{TOKEN_LOG_PROVIDERS}")
         home = entry.get("path")
         if isinstance(home, str):
             root = expand(home)

@@ -219,6 +219,9 @@ class RegistryValidation(unittest.TestCase):
               "path": "/tmp"}],
             [{"label": "x" * 41, "provider": "claude", "path": "/tmp"}],
             [{"label": "interactive", "provider": "other", "path": "/tmp"}],
+            # grok is a valid account provider but has no token-log format, so a
+            # grok token extra-root is rejected (would be scanned as codex)
+            [{"label": "grok-root", "provider": "grok", "path": "/tmp"}],
             [{"label": "alpha", "provider": "claude", "path": "/tmp"}],
             [{"label": "interactive", "provider": "claude", "path": "/tmp"},
              {"label": "interactive", "provider": "codex", "path": "/tmp"}],
